@@ -39,14 +39,90 @@ template config_file_path do
   source "ConfigurationFile.ini.erb"
 end
 
-windows_package node['sql_server']['server']['package_name'] do
-  source node['sql_server']['server']['url']
-  checksum node['sql_server']['server']['checksum']
-  timeout node['sql_server']['server']['installer_timeout']
-  installer_type :custom
-  options "/q /ConfigurationFile=#{config_file_path}"
-  action :install
-end
+if  mssql_username = node['sql_server']['installer_runas_username'] && mssql_password = node['sql_server']['installer_runas_password']
+  if not (registry_key_exists?('HKLM\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL') &&
+          registry_value_exists?(
+            'HKLM\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL',
+            { :name => "#{service_name}", :type => :string, :data => "MSSQL10_50.MSSQLSERVER" }))
+
+
+    # Install working around MS SQL Server installer 'runas' requirements
+    powershell "Install MSSQL" do
+      action :run
+      code <<-EOH
+function ps-runas ([String] $cmd, [String] $arguments)
+{
+  Write-Host "ps-runas cmd: $cmd"
+  Write-Host "ps-runas args: $arguments"
+
+  $secpasswd = ConvertTo-SecureString "#{mssql_password}" -AsPlainText -Force
+
+  $process = New-Object System.Diagnostics.Process
+  $setup = $process.StartInfo
+  $setup.FileName = $cmd
+  $setup.Arguments = $arguments
+  $setup.UserName = "#{mssql_username}"
+  $setup.Password = $secpasswd
+  $setup.Verb = "runas"
+  $setup.UseShellExecute = $false
+  $setup.RedirectStandardError = $true
+  $setup.RedirectStandardOutput = $true
+  $setup.RedirectStandardInput = $false
+
+  # Hook into the standard output and error stream events
+  $errEvent = Register-ObjectEvent -InputObj $process `
+    -Event "ErrorDataReceived" `
+    -Action `
+    {
+        param
+        (
+            [System.Object] $sender,
+            [System.Diagnostics.DataReceivedEventArgs] $e
+        )
+        Write-Host $e.Data
+    }
+  $outEvent = Register-ObjectEvent -InputObj $process `
+    -Event "OutputDataReceived" `
+    -Action `
+    {
+        param
+        (
+            [System.Object] $sender,
+            [System.Diagnostics.DataReceivedEventArgs] $e
+        )
+        Write-Host $e.Data
+    }
+
+  Write-Host "ps-runas starting: $cmd"
+
+  if (!$process.Start())
+  {
+    Write-Error "Failed to start $cmd"
+  }
+
+  $process.BeginOutputReadLine()
+  $process.BeginErrorReadLine()
+
+  # Wait until process exit
+  $process.WaitForExit()
+
+  $process.CancelOutputRead()
+  $process.CancelErrorRead()
+  $process.Close()
+}
+ps-runas "#{node['sql_server']['server']['url']}" "/q /ConfigurationFile=#{config_file_path}"
+      EOH
+    end
+  else
+    windows_package node['sql_server']['server']['package_name'] do
+      source node['sql_server']['server']['url']
+      checksum node['sql_server']['server']['checksum']
+      installer_type :custom
+      options "/q /ConfigurationFile=#{config_file_path}"
+      options "#{node['sql_server']['installer_arguments']} /ConfigurationFile=#{config_file_path}"
+      action :install
+    end
+  end
 
 service service_name do
   action :nothing
